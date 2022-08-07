@@ -1,0 +1,378 @@
+#generating peptide-exon mapping table
+import argparse
+from collections import defaultdict
+
+import regex as re
+from tqdm import tqdm
+
+# Parsing argument given via commandline
+parser = argparse.ArgumentParser(description="GTF and FASTA files")
+parser.add_argument("--gtf", help="Path to Gencode GTF with genomic annotations.")
+parser.add_argument(
+    "--fa", help="Path to Gencode fasta with Protein Coding information."
+)
+args = parser.parse_args()
+
+fa = args.fa
+gtf = args.gtf
+
+exons = defaultdict(dict)
+tgmap = {}
+genes = {}
+
+ctra = ""
+cpos = 0
+tot_len = 0
+
+print("READING GTF")
+
+# params = re.compile(r"(?<=CDS\t)([0-9]+)\t([0-9]+).+(ENSG[0-9]{11}).+(ENST[0-9]{11}).+(?<=gene_name \")([a-zA-Z0-9\-]+)\";.+(?<=exon_number )(\d+);.+(ENSE[0-9]{11})")
+
+# Iterate through gtf getting exon information
+with open(gtf) as f:
+    for line in tqdm(f):
+
+        """if not re.search(r".+ENST00000395284.+", line):
+        continue"""
+
+        if not re.search(r"\s+CDS\s+", line):
+            continue
+
+        # Safe parameter catching
+        """
+        start, stop, ensg, enst, gene, enum, ense = re.search(params, line).groups()
+
+        dna_len = (int(stop) - int(start)) + 1 # Always an int
+        exon_len = dna_len/3  # Can be a float or i
+        """
+
+        # Regex patterns for splitting . and whitespace
+        re_white = re.compile(r"[.\s]{1}")
+        line = re_white.split(line)
+
+        # Faster to strip than to replace all ';\"' with ''
+        ensg = line[10].strip(';"')
+        enst = line[13].strip(';"')
+        gene = line[18].strip(';"')
+        enum = line[24].strip(';"')
+        ense = line[26].strip(';"')
+
+        dna_len = (int(line[4]) - int(line[3])) + 1  # Always an int
+        exon_len = dna_len / 3  # Can be a float or int
+
+        # Reset cpos if moving to a new transcript
+        if enst != ctra:
+            cpos = 1
+            ctra = enst
+
+        # Casting enum from string to int with exception handling
+        try:
+            enum = int(enum)
+        except ValueError:
+            print(f"{enum}: enum cannot be cast as an int")
+            for i, item in enumerate(line):
+                print(f"{i}: {item}")
+            raise
+
+        # Saving data in genes and tgmap
+        genes[ensg] = gene
+        tgmap[enst] = ensg
+
+        exons[enst][enum] = {"id": ense, "st": cpos, "en": cpos + dna_len - 1}
+
+        # Move cpos forward by the exon length
+        cpos = cpos + dna_len
+
+print("END OF GTF")
+
+print("BUILDING PEPTIDE MAP")
+
+
+def peptide_exon_mapping(seq, enst, exons):
+    # There should be 0 cases of this if both files are from the same release
+    try:
+        ord_exons = sorted(exons[enst].keys())
+    except KeyError:
+        print(f"{enst} not found in gtf")
+        return None
+
+    # Replace 'K' or 'R' with 'K,' or 'R,' unless P is next in the sequence
+    seq = re.sub("([KR])(?!P)", "\g<1>,", seq)
+    peptides = seq.split(",")
+
+    # pep_end will be reassigned immediately
+    pep_start = 1
+    pep_end = 0
+
+    enst_dict = defaultdict(dict)
+
+    for n in range(len(peptides)):
+        # Missed Cleavage peptide
+        mc_pep = ""
+
+        # generates peptides with up to range(n-1) missed cleavages
+        for m in range(3):
+            mp = n + m
+            if mp < len(peptides):
+
+                mc_pep += peptides[mp]
+                mc_pep_len = len(mc_pep) * 3
+                pep_end = pep_start + mc_pep_len - 1
+
+                # Checking if peptide is the correct length (6-30 AA)
+                if mc_pep_len >= 18 and mc_pep_len <= 120:
+                    enst_dict[mc_pep] = {}
+
+                    # Update start_ense until the start of the next exon is above the peptide start
+                    for exon_key in ord_exons:
+                        exon_start = exons[enst][exon_key]["st"]
+                        if exon_start > pep_start:
+                            break
+                        start_ense = exons[enst][exon_key]["id"]
+
+                    # Update end_ense until the end of the next exon is below the end of the peptide
+                    for exon_key in ord_exons:
+                        exon_end = exons[enst][exon_key]["en"]
+                        end_ense = exons[enst][exon_key]["id"]
+                        if exon_end > pep_end:
+                            break
+
+                    try:
+                        start_ense
+                        end_ense
+                    except UnboundLocalError:
+                        print(ord_exons)
+                        print(enst)
+                        print(f"pep_start {pep_start} \npep_end {pep_end}")
+                        raise
+
+                    if start_ense == end_ense:
+                        enst_dict[mc_pep]["Exon_ID"] = start_ense
+                    else:
+                        enst_dict[mc_pep]["Exon_ID"] = start_ense + ";" + end_ense
+
+                    enst_dict[mc_pep]["Position"] = pep_start
+                    enst_dict[mc_pep]["MC"] = m
+
+                    ensg = tgmap[enst]
+                    enst_dict[mc_pep]["Gene_ID"] = ensg
+                    enst_dict[mc_pep]["Gene"] = genes[ensg]
+
+        pep_start += len(peptides[n]) * 3
+
+    return enst_dict
+
+
+peptidemap = {}
+seq = ""
+c_enst = ""
+
+with open(fa) as f:
+    for line in tqdm(f):
+
+        # Appends to seq until a new entry is found where peptide_exon_mapping is called
+        m = re.search(r"(ENST\d{11})", line)
+        if m:
+            t_enst = m.group(0)
+
+            # First transcript line
+            if c_enst == "":
+                c_enst = t_enst
+
+            if seq != "":
+                seq = seq.replace("\n", "")  # Removing newline characters
+
+                peptidemap[c_enst] = peptide_exon_mapping(seq, c_enst, exons)
+
+                seq = ""
+                c_enst = t_enst
+        else:
+            seq += re.sub("I", "L", line)
+
+# Process the last entry
+if seq != "":
+    seq = seq.replace("\n", "")
+    peptidemap[c_enst] = peptide_exon_mapping(seq, c_enst, exons)
+
+print("MAPPING COMPLETE!")
+
+print("WRITING TO FILE")
+
+columns = ["Exon_ID", "Gene_ID", "Gene", "Position", "MC"]
+
+with open("Peptide-Exon-Map.txt", "w") as f:
+    for enst in tqdm(peptidemap):
+        for peptide in peptidemap[enst]:
+            f.write(f"{enst}\t{peptide}")
+            for item in columns:
+                f.write(f"\t{peptidemap[enst][peptide][item]}")
+            f.write("\n")
+
+print("COMPLETE")
+
+#further steps for mapping peptides to exons
+import pandas as pd
+import numpy as np
+from pandas import Series
+COREAD_6 = pd.DataFrame(columns=["Gene", "Detected", "Exon_ID", "Exon_Label", "Corr", "Peptide", "Peptide_count", "Detected_count", "Not_Detected_count", "SW48_Normalized", "SNU-175_Normalized", "CL-11_Normalized", "SW948_Normalized", "KM12_Normalized", "SNU-1040_Normalized", "GEO_Normalized", "LIM1215_Normalized", "CW-2_Normalized", "GP5d_Normalized"])
+COREAD_6.to_csv("COREAD_6.csv", sep="\t")
+#merge
+unique_nocleaves_refer = pd.read_csv("C:/Users/rfu/Desktop/Code/peptide-exon-mapper-master/unique_nocleaves_refer.csv", delimiter="\t", engine="c")
+exper_df = pd.read_csv("C:/Users/rfu/Desktop/2016_10Plex/Raw_Exports/23AUG16_colonCa_cells_10plex_6th_exp_variant_search_PeptideGroups.txt", delimiter="\t", engine="c")
+merged_df = pd.merge(exper_df, unique_nocleaves_refer, how="left", left_on=["Sequence"], right_on=["Peptide"])
+unique_df = merged_df.drop_duplicates(subset=["Peptide", "Gene"], keep="first")
+unique_df = unique_df.drop_duplicates(subset="Peptide", keep=False)
+gene = unique_df[["Peptide"]]
+a = pd.merge(merged_df, gene, on=["Peptide", "Peptide"], how="outer", indicator=True)
+new_merged_unique = a.loc[a["_merge"] == "both"].drop("_merge", axis=1)
+new_merged_unique = new_merged_unique.fillna(0)
+new_merged_unique = new_merged_unique.loc[(new_merged_unique["Gene"] != 0)]
+all_gene_list = new_merged_unique["Gene"].drop_duplicates(keep="first")
+all_gene_list.to_csv("all_gene_list_6.txt", sep="\t", index=False, header=False)
+with open('all_gene_list_6.txt') as f:
+    #read each gene line by line
+    for i in f.readlines():
+        #collect peptides created by gene i from experimental file
+        df = new_merged_unique.loc[new_merged_unique["Gene"] == i.rstrip()]
+        #collect all peptides created by gene i from theoretical file
+        refer = unique_nocleaves_refer.loc[unique_nocleaves_refer["Gene"] == i.rstrip()]
+        #identify peptides that present in theoretical file but not in experimental file
+        diff = refer[~refer.Peptide.isin(df.Peptide)]
+        #add those non-identified peptides from theoretical file to experimental file
+        df = pd.concat([df, diff]).fillna(0)
+        #transfer data type to string
+        df["Peptide_Loc"] = df["Peptide_Loc"].astype(str)
+        df["Peptide_Loc_Error"] = df["Peptide_Loc_Error"].astype(str)
+
+        #create new dictionary
+        df_dict = df.copy()
+        df_dict["Exon_Loc"] = df_dict["Exon_Loc"].str.split('[ ;]')
+        df_dict = df_dict.explode('Exon_Loc').reset_index(drop=True)
+        df_a = df_dict.drop_duplicates(subset="Exon_Loc", keep="first")
+        exon_sort_dictionary = {}
+        for exon_coords in df_a["Exon_Loc"]:
+            (start_all, end_all) = exon_coords.split('-')
+            start_all = pd.Series(start_all)
+            end_all = pd.Series(end_all)
+            start = start_all.drop_duplicates()
+            end = end_all.drop_duplicates()
+            start = int(start)
+            end = int(end)
+            if start not in exon_sort_dictionary:
+                exon_sort_dictionary[start] = {}
+            if end not in exon_sort_dictionary[start]:
+                exon_sort_dictionary[start][end] = {}
+            exon_sort_dictionary[start][end][exon_coords] = 1
+        exon_index = 0
+        exon_sub_index = 0
+        exon_index_dictionary = {}
+        previous_end = 0
+        for start in sorted(exon_sort_dictionary):
+            if start > previous_end:
+                exon_index += 1
+                exon_sub_index = 0
+            for end in sorted(exon_sort_dictionary[start]):
+                exon_sub_index += 1
+                for exon_coords in exon_sort_dictionary[start][end]:
+                    exon_index_dictionary[exon_coords] = str(exon_index) + '.' + str(exon_sub_index)
+                if end > previous_end:
+                    previous_end = end
+        #create a new exon label
+        mapping_exon = []
+        for item in df["Exon_Loc"]:
+            splitted_temp = item.split(';')
+            str_res = [exon_index_dictionary.get(df) for df in splitted_temp]
+            str_res = ';'.join(str_res)
+            mapping_exon.append(str_res)
+        df["Exon_Label"] = mapping_exon
+        df_0 = df.drop_duplicates(subset=["Peptide", "Exon_Label"], keep="first")
+        df0 = df_0.groupby("Peptide")["Exon_Label"].apply('/'.join).reset_index()
+        #delete peptides that all scaled coloumns are 0
+        df_1 = df.loc[~((df["Abundances Scaled F1 126 Control"] == 0) & (df["Abundances Scaled F1 127N Sample"] == 0) & (df["Abundances Scaled F1 127C Sample"] == 0) & (df["Abundances Scaled F1 128N Sample"] == 0) & (df["Abundances Scaled F1 128C Sample"] == 0) & (df["Abundances Scaled F1 129N Sample"] == 0) & (df["Abundances Scaled F1 129C Sample"] == 0) & (df["Abundances Scaled F1 130N Sample"] == 0) & (df["Abundances Scaled F1 130C Sample"] == 0) & (df["Abundances Scaled F1 131 Sample"] == 0))]
+        #group scaled columns by peptide
+        df1 = df_1.groupby("Peptide")["Abundances Scaled F1 126 Control", "Abundances Scaled F1 127N Sample", "Abundances Scaled F1 127C Sample", "Abundances Scaled F1 128N Sample", "Abundances Scaled F1 128C Sample", "Abundances Scaled F1 129N Sample", "Abundances Scaled F1 129C Sample", "Abundances Scaled F1 130N Sample", "Abundances Scaled F1 130C Sample", "Abundances Scaled F1 131 Sample"].mean().fillna(0)
+        #add information of ENSE ID and amount, order by ENSE ID
+        df_2 = df.drop_duplicates(subset=["Peptide", "Exon_ID"], keep="first")
+        df_2 = df_2.sort_values(by='Exon_ID', key=lambda x: x.str.split('ENSE').str[-1])
+        df2 = df_2.groupby("Peptide")["Exon_ID"].apply('/'.join).reset_index()
+        df2 = df2.assign(Exon_count = df2.Exon_ID.str.count(r"ENSE\d{11}"))
+        #add information of Exon_Location and amount
+        df_3 = df.drop_duplicates(subset=["Peptide", "Exon_Loc"], keep="first")
+        df3 = df_3.groupby("Peptide")["Exon_Loc"].apply('/'.join).reset_index()
+        df3 = df3.assign(Exon_Loc_count = df3.Exon_Loc.str.count(r"-"))
+        #add information of Peptide_Location
+        df_4 = df.drop_duplicates(subset=["Peptide", "Peptide_Loc"], keep="first")
+        df4 = df_4.groupby("Peptide")["Peptide_Loc"].apply('/'.join).reset_index()
+        #add information of Peptide_location_Error
+        df_5 = df.drop_duplicates(subset=["Peptide", "Peptide_Loc_Error"], keep="first")
+        df5 = df_5.groupby("Peptide")["Peptide_Loc_Error"].apply('/'.join).reset_index()
+        #add information of ENST ID and amount, order by ENST ID.
+        df_6 = df.drop_duplicates(subset=["Peptide", "ENST"], keep="first")
+        df_6 = df_6.sort_values(by='ENST', key=lambda x: x.str.split('ENST').str[-1])
+        df6 = df_6.groupby("Peptide")["ENST"].apply('/'.join).reset_index()
+        df6 = df6.assign(ENST_count = df6.ENST.str.count(r"ENST\d{11}"))
+        #group normalized columns by peptide
+        df_7 = df.loc[~((df["Abundances Normalized F1 126 Control"] == 0) & (df["Abundances Normalized F1 127N Sample"] == 0) & (df["Abundances Normalized F1 127C Sample"] == 0) & (df["Abundances Normalized F1 128N Sample"] == 0) & (df["Abundances Normalized F1 128C Sample"] == 0) & (df["Abundances Normalized F1 129N Sample"] == 0) & (df["Abundances Normalized F1 129C Sample"] == 0) & (df["Abundances Normalized F1 130N Sample"] == 0) & (df["Abundances Normalized F1 130C Sample"] == 0) & (df["Abundances Normalized F1 131 Sample"] == 0))]
+        df7 = df_7.groupby("Peptide")["Abundances Normalized F1 126 Control", "Abundances Normalized F1 127N Sample", "Abundances Normalized F1 127C Sample", "Abundances Normalized F1 128N Sample", "Abundances Normalized F1 128C Sample", "Abundances Normalized F1 129N Sample", "Abundances Normalized F1 129C Sample", "Abundances Normalized F1 130N Sample", "Abundances Normalized F1 130C Sample", "Abundances Normalized F1 131 Sample"].mean().fillna(0)
+        #merge all columns above, order by peptide location
+        a = pd.merge(df2, df3, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        a = pd.merge(a, df0, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        a["Boundary"] = a["Exon_ID"].str.contains(';').astype(int)
+        b = pd.merge(a, df4, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        c = pd.merge(b, df5, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        d = pd.merge(c, df6, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        e = pd.merge(d, df1, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        e = pd.merge(e, df7, how="left", left_on=["Peptide"], right_on=["Peptide"])
+        #e.rename(columns = {"Abundances Scaled F1 126 Control":"SW48", "Abundances Scaled F1 127N Sample":"HT-115", "Abundances Scaled F1 127C Sample":"SNU-407", "Abundances Scaled F1 128N Sample":"SNU-C2B", "Abundances Scaled F1 128C Sample":"HCC-56", "Abundances Scaled F1 129N Sample":"SW1463", "Abundances Scaled F1 129C Sample":"HT-29", "Abundances Scaled F1 130N Sample":"LS-180", "Abundances Scaled F1 130C Sample":"CaR-1", "Abundances Scaled F1 131 Sample":"MDST8"}, inplace=True)
+        #e.rename(columns = {"Abundances Normalized F1 126 Control":"SW48_Normalized", "Abundances Normalized F1 127N Sample":"COLO-205_Normalized", "Abundances Normalized F1 127C Sample":"COLO-741_Normalized", "Abundances Normalized F1 128N Sample":"LS-411N_Normalized", "Abundances Normalized F1 128C Sample":"NCI-H508_Normalized", "Abundances Normalized F1 129N Sample":"SW1116_Normalized", "Abundances Normalized F1 129C Sample":"SW837_Normalized", "Abundances Normalized F1 130N Sample":"COLO-678_Normalized", "Abundances Normalized F1 130C Sample":"SNU-61_Normalized", "Abundances Normalized F1 131 Sample":"CCK-81_Normalized"}, inplace=True)
+        e['sort'] = e["Peptide_Loc"].str.split('.', n=1).str.get(0)
+        e.sort_values('sort', inplace=True)
+        e = e.drop('sort', axis=1).fillna(0)
+        #add two columns to count how many peptides detected or not
+        def categorise(dff):
+            if dff["Abundances Normalized F1 126 Control"] == 0 and dff["Abundances Normalized F1 127N Sample"] == 0 and dff["Abundances Normalized F1 127C Sample"] == 0 and dff["Abundances Normalized F1 128N Sample"] == 0 and dff["Abundances Normalized F1 128C Sample"] == 0 and dff["Abundances Normalized F1 129N Sample"] == 0 and dff["Abundances Normalized F1 129C Sample"] == 0 and dff["Abundances Normalized F1 130N Sample"] == 0 and dff["Abundances Normalized F1 130C Sample"] == 0 and dff["Abundances Normalized F1 131 Sample"] == 0:
+                return '0'
+            else:
+                return '1'
+        e["Detected"] = e.apply(lambda row: categorise(row), axis=1)
+        #print(e["Detected"])
+        #e.to_csv(i.rstrip()+"_heatmap_pep.csv", sep="\t")
+
+        #sort by exon labels
+        e_1 = e.groupby("Exon_Label")["Peptide"].apply(';'.join).reset_index()
+        e_df = e.loc[e['Detected'] == '1']
+        e_2 = e.groupby("Exon_Label")["Abundances Normalized F1 126 Control", "Abundances Normalized F1 127N Sample", "Abundances Normalized F1 127C Sample", "Abundances Normalized F1 128N Sample", "Abundances Normalized F1 128C Sample", "Abundances Normalized F1 129N Sample", "Abundances Normalized F1 129C Sample", "Abundances Normalized F1 130N Sample", "Abundances Normalized F1 130C Sample", "Abundances Normalized F1 131 Sample"].sum().fillna(0)
+        e_3 = e.groupby("Exon_Label")["Detected"].apply(';'.join).reset_index()
+        e_4 = e.groupby("Exon_Label")["Exon_ID"].apply('//'.join).reset_index()
+        e1 = pd.merge(e_1, e_3, how="left", left_on=["Exon_Label"], right_on=["Exon_Label"])
+        e2 = pd.merge(e1, e_4, how="left", left_on=["Exon_Label"], right_on=["Exon_Label"])
+        e2 = e2.assign(Peptide_count = e1.Peptide.str.count(";") +1)
+        e2 = e2.assign(Detected_count = e1.Detected.str.count(r"1"))
+        e2 = e2.assign(Not_Detected_count = e1.Detected.str.count(r"0"))
+        e3 = pd.merge(e2, e_2, how="left", left_on=["Exon_Label"], right_on=["Exon_Label"])
+        e3['sort'] = e3["Exon_Label"].str.split('.', 1).str.get(0).astype(int)
+        e3.sort_values('sort', inplace=True)
+        e3 = e3.drop('sort', axis=1).fillna(0)
+        #e3.to_csv(i.rstrip()+"_heatmap_exon.csv", sep="\t")
+
+        #find the deviation
+        gene_max= e[["Abundances Normalized F1 126 Control", "Abundances Normalized F1 127N Sample", "Abundances Normalized F1 127C Sample", "Abundances Normalized F1 128N Sample", "Abundances Normalized F1 128C Sample", "Abundances Normalized F1 129N Sample", "Abundances Normalized F1 129C Sample", "Abundances Normalized F1 130N Sample", "Abundances Normalized F1 130C Sample", "Abundances Normalized F1 131 Sample"]].max()
+        corr_val = e3.corrwith(pd.Series(gene_max, index=e3.columns), method="spearman", axis=1)
+        e4 = e3.assign(Corr = corr_val)
+        e4["Gene"] = i.rstrip()
+        #e4 = e4.drop("Detected", axis=1, inplace=True)
+        e4 = e4[["Gene", "Detected", "Exon_ID", "Exon_Label", "Corr", "Peptide", "Peptide_count", "Detected_count", "Not_Detected_count", "Abundances Normalized F1 126 Control", "Abundances Normalized F1 127N Sample", "Abundances Normalized F1 127C Sample", "Abundances Normalized F1 128N Sample", "Abundances Normalized F1 128C Sample", "Abundances Normalized F1 129N Sample", "Abundances Normalized F1 129C Sample", "Abundances Normalized F1 130N Sample", "Abundances Normalized F1 130C Sample", "Abundances Normalized F1 131 Sample"]]
+        e4.rename(columns = {"Abundances Normalized F1 126 Control":"SW48_Normalized", "Abundances Normalized F1 127N Sample":"SNU-175_Normalized", "Abundances Normalized F1 127C Sample":"CL-11_Normalized", "Abundances Normalized F1 128N Sample":"SW948_Normalized", "Abundances Normalized F1 128C Sample":"KM12_Normalized", "Abundances Normalized F1 129N Sample":"SNU-1040_Normalized", "Abundances Normalized F1 129C Sample":"GEO_Normalized", "Abundances Normalized F1 130N Sample":"LIM1215_Normalized", "Abundances Normalized F1 130C Sample":"CW-2_Normalized", "Abundances Normalized F1 131 Sample":"GP5d_Normalized"}, inplace=True)
+        e4.to_csv("COREAD_6.csv", header=False, mode = 'a', sep="\t")
+
+        #automatic aberrant exons detection
+        df = pd.read_csv("C:/Users/rfu/Desktop/Code/peptide-exon-mapper-master/COREAD_2.csv", delimiter="\t", engine="c")
+        gene = df.drop_duplicates(subset="Gene", keep="first")
+        print(gene.shape)
+        df["Corr"] = df["Corr"].fillna(0)
+        dff = df.loc[(df["Corr"] < 0.5) & (df["Corr"] != 0)]
+        dff1 = dff.loc[df["Peptide_count"] > 0]
+        ss = dff1.drop_duplicates(subset="Gene", keep="first")
+        print(ss.shape)
+        dff2 = dff.loc[df["Peptide_count"] == 1]
+        print(dff2.shape)
